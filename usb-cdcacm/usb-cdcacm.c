@@ -43,6 +43,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 //#include "toboot.h"
 //TOBOOT_CONFIGURATION(0);
@@ -59,8 +60,11 @@
 #define PRODUCT_ID                0x70b1    /* Assigned to Tomu project */
 #define DEVICE_VER                0x0101    /* Program version */
 
+#define LED_PATTERN_BUFFER_SIZE 128
+
 static volatile bool g_usbd_is_connected = false;
 static usbd_device *g_usbd_dev = 0;
+static char g_led_pattern[LED_PATTERN_BUFFER_SIZE] = "g1000";
 
 static const struct usb_device_descriptor dev = {
     .bLength = USB_DT_DEVICE_SIZE,
@@ -232,13 +236,15 @@ static enum usbd_request_return_codes cdcacm_control_request(usbd_device *usbd_d
     switch(req->bRequest) {
     case USB_CDC_REQ_SET_CONTROL_LINE_STATE: {
         g_usbd_is_connected = req->wValue & 1; /* Check RTS bit */
-        if (!g_usbd_is_connected) /* Note: GPIO polarity is inverted */
+        /*
+        if (!g_usbd_is_connected) // Note: GPIO polarity is inverted
             gpio_set(LED_GREEN_PORT, LED_GREEN_PIN);
         else
             gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);
+        */
         return USBD_REQ_HANDLED;
         }
-    case USB_CDC_REQ_SET_LINE_CODING: 
+    case USB_CDC_REQ_SET_LINE_CODING:
         if(*len < sizeof(struct usb_cdc_line_coding))
             return 0;
 
@@ -247,23 +253,50 @@ static enum usbd_request_return_codes cdcacm_control_request(usbd_device *usbd_d
     return 0;
 }
 
+static void execute_led_pattern()
+{
+    unsigned int i = 0;
+    unsigned int num_chars_read = 0;
+    unsigned int delay_ms = 0;
+    while(i < sizeof(g_led_pattern)) {
+        if (g_led_pattern[i] == 'r') {
+            gpio_toggle(LED_RED_PORT, LED_RED_PIN);
+            i++;
+        }
+        else if (g_led_pattern[i] == 'g') {
+            gpio_toggle(LED_GREEN_PORT, LED_GREEN_PIN);
+            i++;
+        }
+        else {
+            int ret = sscanf(g_led_pattern + i, "%u%n%*s", &delay_ms, &num_chars_read);
+            if (ret <= 0) {
+                return;
+            }
+            udelay_busy(delay_ms * 1000);
+            i += num_chars_read;
+        }
+    }
+}
+
+static void leds_off()
+{
+    gpio_set(LED_RED_PORT, LED_RED_PIN);
+    gpio_set(LED_GREEN_PORT, LED_GREEN_PIN);
+}
+
 /* Simple callback that echoes whatever is sent */
 static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 {
     (void)ep;
 
-    char buf[64];
-    int len = usbd_ep_read_packet(usbd_dev, 0x01, buf, sizeof(buf));
-
-    if (len) {
-        if (buf[0] == '\r') {
-            buf[1] = '\n';
-            buf[2] = '\0';
-            len++;
-        }
-        usbd_ep_write_packet(usbd_dev, 0x82, buf, len);
-        buf[len] = 0;
+    int len = usbd_ep_read_packet(usbd_dev, 0x01, g_led_pattern, LED_PATTERN_BUFFER_SIZE);
+    if (len > 0) {
+        g_led_pattern[len] = 0;
+        // turn off LEDs to ensure correct pattern
+        leds_off();
     }
+
+    usbd_ep_write_packet(usbd_dev, 0x82, g_led_pattern, len);
 }
 
 static void cdcacm_set_config(usbd_device *usbd_dev, uint16_t wValue)
@@ -281,12 +314,6 @@ static void cdcacm_set_config(usbd_device *usbd_dev, uint16_t wValue)
                 cdcacm_control_request);
 }
 
-static void usb_puts(char *s) {
-    if (g_usbd_is_connected) {
-        usbd_ep_write_packet(g_usbd_dev, 0x82, s, strnlen(s, 64));
-    }
-}
-
 void usb_isr(void)
 {
     usbd_poll(g_usbd_dev);
@@ -299,8 +326,6 @@ void hard_fault_handler(void)
 
 int main(void)
 {
-    bool line_was_connected = false;
-
     /* Disable the watchdog that the bootloader started. */
     WDOG_CTRL = 0;
 
@@ -310,6 +335,8 @@ int main(void)
     /* Set up both LEDs as outputs */
     gpio_mode_setup(LED_RED_PORT, GPIO_MODE_WIRED_AND, LED_RED_PIN);
     gpio_mode_setup(LED_GREEN_PORT, GPIO_MODE_WIRED_AND, LED_GREEN_PIN);
+
+    leds_off();
 
     /* Configure the USB core & stack */
     g_usbd_dev = usbd_init(&efm32hg_usb_driver, &dev, &config, usb_strings, 3, usbd_control_buffer, sizeof(usbd_control_buffer));
@@ -325,17 +352,6 @@ int main(void)
     nvic_enable_irq(NVIC_USB_IRQ);
 
     while(1) {
-        if (line_was_connected != g_usbd_is_connected) {
-            if (g_usbd_is_connected) {
-                udelay_busy(2000);
-                usb_puts("\r\nHello world!\r\n");
-                udelay_busy(2000);
-            }
-            line_was_connected = g_usbd_is_connected;
-        }
-
-        usb_puts("toggling LED\n\r");            
-        gpio_toggle(LED_RED_PORT, LED_RED_PIN);  
-        udelay_busy(300000);
+        execute_led_pattern();
     }
 }
